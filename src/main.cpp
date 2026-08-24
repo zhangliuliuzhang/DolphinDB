@@ -234,21 +234,22 @@ struct NumInterner {
 };
 
 static constexpr uint32_t STRBIT = 0x80000000u;
+static constexpr uint32_t DIRBIT = 0x40000000u;
 
 struct LocalParse {
-    Interner strs;        // non-numeric node ids
-    NumInterner nums;     // numeric node ids
+    Interner strs;        // non-numeric node ids (fallback path)
+    NumInterner nums;     // numeric node ids (fallback path)
     Interner labels;
     std::vector<int32_t> rowLabel;
     std::vector<uint64_t> rowOff;
-    std::vector<uint32_t> nbrs;  // local ids; high bit set = string id
-    std::vector<Span> rowIdSpan;
-    std::vector<uint64_t> rowNum;
-    std::vector<uint8_t> rowNumOk;
+    std::vector<uint32_t> nbrs;  // local ids; STRBIT = string id, DIRBIT = direct row id
 };
 
 // Parse rows in byte range [a, b); both ends are line-aligned by the caller.
-static void parseRange(const char* buf, size_t a, size_t b, LocalParse& out) {
+// rowCanon[r] is nonzero iff row r's id is the canonical decimal form of r,
+// in which case it holds the id's length (dense-numeric fast path).
+static void parseRange(const char* buf, size_t a, size_t b, const uint8_t* rowCanon, size_t R,
+                       LocalParse& out) {
     const char* p = buf + a;
     const char* e = buf + b;
     while (p < e) {
@@ -290,11 +291,6 @@ static void parseRange(const char* buf, size_t a, size_t b, LocalParse& out) {
             f3 = {s, (uint32_t)(p - s)};
             if (f3.len && f3.p[f3.len - 1] == '\r') --f3.len;
         }
-        uint64_t rv = 0;
-        bool okNum = parse_num(f1.p, f1.len, rv);
-        out.rowIdSpan.push_back(f1);
-        out.rowNum.push_back(rv);
-        out.rowNumOk.push_back(okNum ? 1 : 0);
         out.rowLabel.push_back(out.labels.intern(f2.p, f2.len, hash_str(f2.p, f2.len)));
         out.rowOff.push_back(out.nbrs.size());
         if (f3.len >= 2 && f3.p[0] == '[') {
@@ -302,60 +298,58 @@ static void parseRange(const char* buf, size_t a, size_t b, LocalParse& out) {
             const char* ne = f3.p + f3.len;
             while (ne > q && ne[-1] != ']') --ne;
             if (ne > q) --ne;  // ne points at ']' so the last id span excludes it
-            // 3-deep pipeline: parse ahead, prefetch slots, intern lagging entry
-            Span S[3];
-            uint64_t V[3] = {0, 0, 0}, H[3] = {0, 0, 0};
-            bool N[3] = {false, false, false};
-            int len = 0;
-            // parse the first span (no leading comma to skip)
+            // 4-deep circular pipeline: parse ahead, prefetch slots, intern lagging entry
+            Span S[4];
+            uint64_t V[4] = {0, 0, 0, 0}, H[4] = {0, 0, 0, 0};
+            bool N[4] = {false, false, false, false};
+            int len = 0, head = 0;
             if (q < ne) {
                 S[0].p = q;
                 while (q < ne && *q != ',') ++q;
                 S[0].len = (uint32_t)(q - S[0].p);
                 if (S[0].len) {
                     N[0] = parse_num(S[0].p, S[0].len, V[0]);
-                    if (!N[0]) H[0] = hash_str(S[0].p, S[0].len);
-                    size_t mk = N[0] ? out.nums.mask() : out.strs.mask();
-                    __builtin_prefetch(N[0] ? (void*)&out.nums.tab[num_hash(V[0], S[0].len) & mk]
-                                            : (void*)&out.strs.tab[H[0] & mk]);
+                    if (N[0])
+                        __builtin_prefetch(&rowCanon[V[0]]);
+                    else
+                        H[0] = hash_str(S[0].p, S[0].len),
+                        __builtin_prefetch(&out.strs.tab[H[0] & out.strs.mask()]);
                     len = 1;
                 }
             }
             auto parseNext = [&]() {
-                if (len >= 3) return;
-                if (q >= ne) return;
+                if (len >= 4 || q >= ne) return;
                 ++q;  // skip ','
                 if (q >= ne) return;
-                Span s;
-                s.p = q;
+                int k = (head + len) & 3;
+                S[k].p = q;
                 while (q < ne && *q != ',') ++q;
-                s.len = (uint32_t)(q - s.p);
-                if (!s.len) return;
-                int k = len;
-                S[k] = s;
-                N[k] = parse_num(s.p, s.len, V[k]);
-                if (!N[k]) H[k] = hash_str(s.p, s.len);
-                size_t mk = N[k] ? out.nums.mask() : out.strs.mask();
-                __builtin_prefetch(N[k] ? (void*)&out.nums.tab[num_hash(V[k], S[k].len) & mk]
-                                        : (void*)&out.strs.tab[H[k] & mk]);
+                S[k].len = (uint32_t)(q - S[k].p);
+                if (!S[k].len) return;
+                N[k] = parse_num(S[k].p, S[k].len, V[k]);
+                if (N[k])
+                    __builtin_prefetch(&rowCanon[V[k]]);  // direct-hit fast path
+                else
+                    H[k] = hash_str(S[k].p, S[k].len),
+                    __builtin_prefetch(&out.strs.tab[H[k] & out.strs.mask()]);
                 ++len;
             };
             parseNext();
             parseNext();
+            parseNext();
             while (len > 0) {
                 parseNext();
-                if (N[0])
-                    out.nbrs.push_back((uint32_t)out.nums.intern(V[0], S[0].len));
-                else
-                    out.nbrs.push_back(STRBIT | (uint32_t)out.strs.intern(S[0].p, S[0].len, H[0]));
-                S[0] = S[1];
-                S[1] = S[2];
-                V[0] = V[1];
-                V[1] = V[2];
-                H[0] = H[1];
-                H[1] = H[2];
-                N[0] = N[1];
-                N[1] = N[2];
+                int h = head & 3;
+                // fast path: numeric id in canonical decimal form matching its
+                // own row -> the global id is exactly the row index
+                if (N[h] && V[h] < R && rowCanon[V[h]] == S[h].len) {
+                    out.nbrs.push_back(DIRBIT | (uint32_t)V[h]);
+                } else if (N[h]) {
+                    out.nbrs.push_back((uint32_t)out.nums.intern(V[h], S[h].len));
+                } else {
+                    out.nbrs.push_back(STRBIT | (uint32_t)out.strs.intern(S[h].p, S[h].len, H[h]));
+                }
+                ++head;
                 --len;
             }
         }
@@ -386,7 +380,10 @@ int main(int argc, char** argv) {
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             F = (size_t)st.st_size;
             void* m = mmap(nullptr, F, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (m != MAP_FAILED) buf = (const char*)m;
+            if (m != MAP_FAILED) {
+                buf = (const char*)m;
+                madvise(m, F, MADV_WILLNEED);
+            }
         }
     }
 #endif
@@ -433,35 +430,78 @@ int main(int argc, char** argv) {
         rng[0] = q ? (size_t)((const char*)q - buf) + 1 : F;
     }
 
-    // ---------- parallel parse ----------
-    std::vector<LocalParse> locals(T);
+    // ---------- pre-pass: count rows, extract id spans and numeric values ----------
+    struct RowInfo {
+        Span s;
+        uint64_t val;
+        uint8_t ok;
+    };
+    std::vector<std::vector<RowInfo>> ptInfo(T);
 #pragma omp parallel num_threads(T)
     {
         int tid = omp_get_thread_num();
-        auto& lp = locals[tid];
-        size_t a = rng[tid], b = rng[tid + 1];
-        size_t est = (b - a) / 300 + 16;
-        lp.nums.init(est);
-        lp.strs.init(1024);
-        lp.labels.init(64);
-        lp.rowLabel.reserve(est);
-        lp.rowOff.reserve(est + 1);
-        lp.nbrs.reserve((b - a) / 40 + 16);
-        parseRange(buf, a, b, lp);
+        const char* p = buf + rng[tid];
+        const char* e = buf + rng[tid + 1];
+        auto& ri = ptInfo[tid];
+        ri.reserve((size_t)(e - p) / 200 + 16);
+        while (p < e) {
+            while (p < e && (*p == '\r' || *p == '\n')) ++p;
+            if (p >= e) break;
+            Span f1;
+            if (*p == '"') {
+                const char* s = ++p;
+                while (p < e && *p != '"') ++p;
+                f1 = {s, (uint32_t)(p - s)};
+                if (p < e) ++p;
+            } else {
+                const char* s = p;
+                while (p < e && *p != ',' && *p != '\n') ++p;
+                f1 = {s, (uint32_t)(p - s)};
+            }
+            uint64_t v = 0;
+            bool ok = parse_num(f1.p, f1.len, v);
+            ri.push_back({f1, v, static_cast<uint8_t>(ok)});
+            const void* q = memchr(p, '\n', (size_t)(e - p));
+            if (!q) break;
+            p = (const char*)q + 1;
+        }
     }
     std::vector<size_t> rowBase(T + 1, 0);
     size_t R = 0;
     for (int i = 0; i < T; ++i) {
         rowBase[i] = R;
-        R += locals[i].rowLabel.size();
+        R += ptInfo[i].size();
+    }
+    std::vector<Span> idSpan(R);
+    std::vector<uint64_t> numVal(R, 0);
+    std::vector<uint8_t> rowCanon(R, 0);  // nonzero = row id is canonical decimal of its index
+    bool allNum = true;
+    for (int i = 0; i < T; ++i) {
+        const auto& ri = ptInfo[i];
+        size_t base = rowBase[i];
+        for (size_t j = 0; j < ri.size(); ++j) {
+            size_t rowIdx = base + j;
+            idSpan[rowIdx] = ri[j].s;
+            numVal[rowIdx] = ri[j].val;
+            if (!ri[j].ok) {
+                allNum = false;
+                continue;
+            }
+            // canonical iff value equals the row index and no leading zeros
+            uint64_t v = ri[j].val;
+            uint32_t dl = 1;
+            for (uint64_t x = v; x >= 10; x /= 10) ++dl;
+            rowCanon[rowIdx] =
+                (v == rowIdx && ri[j].s.len == dl) ? (uint8_t)dl : (uint8_t)0;
+        }
     }
     if (timing) {
-        fprintf(stderr, "parse: %.3fs (R=%zu)\n", now_s() - t, R);
+        fprintf(stderr, "prepass: %.3fs (R=%zu)\n", now_s() - t, R);
         t = now_s();
     }
 
-    // ---------- sharded global tables ----------
-    // phase 1: insert row ids (numeric -> NumShard, else string shard)
+    // ---------- parallel parse + fused row-id insertion ----------
+    std::vector<LocalParse> locals(T);
     std::vector<std::mutex> numLock(NSH), strLock(NSH);
     std::vector<NumInterner> numSh(NSH);
     std::vector<Interner> strSh(NSH);
@@ -473,51 +513,34 @@ int main(int argc, char** argv) {
     {
         int tid = omp_get_thread_num();
         auto& lp = locals[tid];
-        for (size_t i = 0; i < lp.rowIdSpan.size(); ++i) {
+        size_t a = rng[tid], b = rng[tid + 1];
+        size_t est = (b - a) / 300 + 16;
+        lp.nums.init(est);
+        lp.strs.init(1024);
+        lp.labels.init(64);
+        lp.rowLabel.reserve(est);
+        lp.rowOff.reserve(est + 1);
+        lp.nbrs.reserve((b - a) / 8 + 16);
+        parseRange(buf, a, b, rowCanon.data(), R, lp);
+        // insert this thread's row ids into the sharded global tables (fused)
+        const auto& ri = ptInfo[tid];
+        for (size_t i = 0; i < ri.size(); ++i) {
             int32_t rowIdx = (int32_t)(rowBase[tid] + i);
-            if (lp.rowNumOk[i]) {
-                int sh = (int)(num_hash(lp.rowNum[i], lp.rowIdSpan[i].len) >> 40 & (NSH - 1));
+            if (ri[i].ok) {
+                uint64_t h = num_hash(ri[i].val, ri[i].s.len);
+                int sh = (int)(h >> 40 & (NSH - 1));
                 std::lock_guard<std::mutex> g(numLock[sh]);
-                numSh[sh].insertVal(lp.rowNum[i], lp.rowIdSpan[i].len, rowIdx);
+                numSh[sh].insertVal(ri[i].val, ri[i].s.len, rowIdx);
             } else {
-                Span s = lp.rowIdSpan[i];
-                uint64_t h = hash_str(s.p, s.len);
+                uint64_t h = hash_str(ri[i].s.p, ri[i].s.len);
                 int sh = (int)((h >> 40) & (NSH - 1));
                 std::lock_guard<std::mutex> g(strLock[sh]);
-                strSh[sh].insertVal(s.p, s.len, h, rowIdx);
+                strSh[sh].insertVal(ri[i].s.p, ri[i].s.len, h, rowIdx);
             }
         }
     }
     if (timing) {
-        fprintf(stderr, "rowid-insert: %.3fs\n", now_s() - t);
-        t = now_s();
-    }
-    std::atomic<int32_t> extraCnt((int32_t)R);  // neighbour-only ids come after rows
-    std::vector<std::vector<int32_t>> nodeMapNum(T), nodeMapStr(T);
-#pragma omp parallel num_threads(T)
-    {
-        int tid = omp_get_thread_num();
-        auto& lp = locals[tid];
-        nodeMapNum[tid].resize(lp.nums.occ);
-        for (size_t k = 0; k < lp.nums.idkey.size(); ++k) {
-            auto [val, len] = lp.nums.idkey[k];
-            int sh = (int)(num_hash(val, len) >> 40 & (NSH - 1));
-            std::lock_guard<std::mutex> g(numLock[sh]);
-            nodeMapNum[tid][k] = numSh[sh].lookupOrAssign(val, len, extraCnt);
-        }
-        nodeMapStr[tid].resize(lp.strs.occ);
-        const size_t nTab = lp.strs.tab.size();
-        for (size_t i = 0; i < nTab; ++i) {
-            const Interner::Ent& en = lp.strs.tab[i];
-            if (!en.used) continue;
-            int sh = (int)((en.h >> 40) & (NSH - 1));
-            std::lock_guard<std::mutex> g(strLock[sh]);
-            nodeMapStr[tid][en.id] = strSh[sh].lookupOrAssign(en.p, en.len, en.h, extraCnt);
-        }
-    }
-    const int32_t N = extraCnt.load(std::memory_order_relaxed);
-    if (timing) {
-        fprintf(stderr, "resolve: %.3fs (N=%d, extra=%d)\n", now_s() - t, N, N - (int32_t)R);
+        fprintf(stderr, "parse: %.3fs\n", now_s() - t);
         t = now_s();
     }
 
@@ -547,67 +570,102 @@ int main(int argc, char** argv) {
     std::vector<int32_t> rank(L);
     for (int32_t r = 0; r < L; ++r) rank[orderByRank[r]] = r;
 
-    // ---------- CSR adjacency in row order ----------
-    std::vector<uint64_t> off(N + 1, 0);
+    // ---------- fused: resolve local ids + build CSR ----------
+    // Extra ids (neighbour-only, >= R) have degree 0, so the degree prefix over
+    // rows is already final for adjacency; extend it for the extra range below.
+    std::vector<uint64_t> offRow(R + 1, 0);
     for (int tid = 0; tid < T; ++tid) {
         auto& lp = locals[tid];
         for (size_t i = 0; i < lp.rowLabel.size(); ++i)
-            off[rowBase[tid] + (int32_t)i + 1] = lp.rowOff[i + 1] - lp.rowOff[i];
+            offRow[rowBase[tid] + (int32_t)i + 1] = lp.rowOff[i + 1] - lp.rowOff[i];
     }
-    for (int32_t i = 0; i < N; ++i) off[i + 1] += off[i];
-    auto adj = std::make_unique_for_overwrite<uint32_t[]>(off[N]);
+    for (int32_t i = 0; i < (int32_t)R; ++i) offRow[i + 1] += offRow[i];
+    auto adj = std::make_unique_for_overwrite<uint32_t[]>(offRow[R]);
+#if defined(__linux__)
+    madvise(adj.get(), offRow[R] * sizeof(uint32_t), MADV_HUGEPAGE);
+#endif
+    std::atomic<int32_t> extraCnt((int32_t)R);  // neighbour-only ids come after rows
+    std::vector<std::vector<int32_t>> nodeMapNum(T), nodeMapStr(T);
 #pragma omp parallel num_threads(T)
     {
         int tid = omp_get_thread_num();
         auto& lp = locals[tid];
-        uint32_t* dst = adj.get() + off[rowBase[tid]];
+        // resolve numeric fallback ids
+        nodeMapNum[tid].resize(lp.nums.occ);
+        const size_t kn = lp.nums.idkey.size();
+        for (size_t k = 0; k < kn; ++k) {
+            if (k + 2 < kn) {
+                auto [v2, l2] = lp.nums.idkey[k + 2];
+                uint64_t h2 = num_hash(v2, l2);
+                int sh2 = (int)(h2 >> 40 & (NSH - 1));
+                __builtin_prefetch(&numSh[sh2].tab[h2 & numSh[sh2].mask()]);
+            }
+            auto [val, len] = lp.nums.idkey[k];
+            int sh = (int)(num_hash(val, len) >> 40 & (NSH - 1));
+            std::lock_guard<std::mutex> g(numLock[sh]);
+            nodeMapNum[tid][k] = numSh[sh].lookupOrAssign(val, len, extraCnt);
+        }
+        // resolve string fallback ids
+        nodeMapStr[tid].resize(lp.strs.occ);
+        const size_t nTab = lp.strs.tab.size();
+        for (size_t i = 0; i < nTab; ++i) {
+            const Interner::Ent& en = lp.strs.tab[i];
+            if (!en.used) continue;
+            int sh = (int)((en.h >> 40) & (NSH - 1));
+            std::lock_guard<std::mutex> g(strLock[sh]);
+            nodeMapStr[tid][en.id] = strSh[sh].lookupOrAssign(en.p, en.len, en.h, extraCnt);
+        }
+        // CSR copy (depends only on this thread's node maps)
+        uint32_t* dst = adj.get() + offRow[rowBase[tid]];
         const int32_t* nmN = nodeMapNum[tid].data();
         const int32_t* nmS = nodeMapStr[tid].data();
         for (uint32_t v : lp.nbrs) {
             if (v & STRBIT)
                 *dst++ = (uint32_t)nmS[v & 0x7fffffffu];
+            else if (v & DIRBIT)
+                *dst++ = v & 0x3fffffffu;
             else
                 *dst++ = (uint32_t)nmN[v];
         }
     }
+    const int32_t N = extraCnt.load(std::memory_order_relaxed);
+    // off[] over all N nodes (extra nodes have zero degree)
+    std::vector<uint64_t> off(N + 1, 0);
+    std::copy(offRow.begin(), offRow.end(), off.begin());
+    for (int32_t i = R + 1; i <= N; ++i) off[i] = offRow[R];
     if (timing) {
-        fprintf(stderr, "csr: %.3fs (E=%llu)\n", now_s() - t, (unsigned long long)off[N]);
+        fprintf(stderr, "resolve+csr: %.3fs (N=%d, extra=%d)\n", now_s() - t, N,
+                N - (int32_t)R);
         t = now_s();
     }
 
-    // ---------- assemble row data ----------
-    std::vector<int32_t> rowLabelG(R);
-    std::vector<uint64_t> numVal(R, 0);
-    std::vector<Span> idSpan(N);
-    bool allNum = true;
-#pragma omp parallel num_threads(T)
+    // ---------- initial labels ----------
+    std::vector<int32_t> cur(N, 0), nxt(N, 0);
+#if defined(__linux__)
+    madvise(cur.data(), (size_t)N * sizeof(int32_t), MADV_HUGEPAGE);
+    madvise(nxt.data(), (size_t)N * sizeof(int32_t), MADV_HUGEPAGE);
+#endif
     {
-        int tid = omp_get_thread_num();
-        auto& lp = locals[tid];
-        size_t base = rowBase[tid];
-        for (size_t i = 0; i < lp.rowLabel.size(); ++i) {
-            rowLabelG[base + i] = labMap[tid][lp.rowLabel[i]];
-            numVal[base + i] = lp.rowNum[i];
-            idSpan[base + i] = lp.rowIdSpan[i];
+        std::vector<int32_t> rowLabelG(R);
+#pragma omp parallel num_threads(T)
+        {
+            int tid = omp_get_thread_num();
+            auto& lp = locals[tid];
+            size_t base = rowBase[tid];
+            for (size_t i = 0; i < lp.rowLabel.size(); ++i)
+                rowLabelG[base + i] = labMap[tid][lp.rowLabel[i]];
         }
+        for (size_t r = 0; r < R; ++r) cur[r] = rank[rowLabelG[r]];
     }
-    for (int tid = 0; tid < T && allNum; ++tid)
-        for (uint8_t ok : locals[tid].rowNumOk)
-            if (!ok) {
-                allNum = false;
-                break;
-            }
     {
         std::vector<LocalParse>().swap(locals);
         std::vector<std::vector<int32_t>>().swap(nodeMapNum);
         std::vector<std::vector<int32_t>>().swap(nodeMapStr);
         std::vector<std::vector<int32_t>>().swap(labMap);
+        std::vector<std::vector<RowInfo>>().swap(ptInfo);
     }
 
     // ---------- synchronous label propagation (active-frontier) ----------
-    std::vector<int32_t> cur(N, 0), nxt(N, 0);
-    for (size_t r = 0; r < R; ++r) cur[r] = rank[rowLabelG[r]];
-
     int iters = 0;
     {
         std::vector<std::vector<uint32_t>> stamp(T, std::vector<uint32_t>(L, 0));
@@ -635,7 +693,7 @@ int main(int argc, char** argv) {
                     int32_t best = -1, bc = 0;
                     uint64_t jEnd = off[u + 1];
                     for (uint64_t j = off[u]; j < jEnd; ++j) {
-                        if (j + 4 < jEnd) __builtin_prefetch(&cur[adj[j + 4]]);
+                        if (j + 24 < jEnd) __builtin_prefetch(&cur[adj[j + 24]]);
                         int32_t l = cur[adj[j]];
                         if (st[l] != sv) {
                             st[l] = sv;
@@ -657,7 +715,7 @@ int main(int argc, char** argv) {
                     size_t a0 = na * (size_t)tid / T, a1 = na * (size_t)(tid + 1) / T;
                     for (size_t i = a0; i < a1; ++i) nodeBody(active[i]);
                 } else {
-#pragma omp for schedule(static)
+#pragma omp for schedule(dynamic, 16384)
                     for (int64_t u = 0; u < N; ++u) nodeBody((int32_t)u);
                 }
             }
@@ -781,13 +839,12 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> rowOut(R + 1);
     rowOut[0] = HLEN;
     for (size_t i = 0; i < R; ++i) rowOut[i + 1] = rowOut[i] + rowLen[rows[i]];
-    std::string out;
-    out.resize(rowOut[R]);
-    memcpy(out.data(), "node_id,final_label\n", HLEN);
+    auto out = std::make_unique_for_overwrite<char[]>(rowOut[R]);
+    memcpy(out.get(), "node_id,final_label\n", HLEN);
 #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < (int64_t)R; ++i) {
         int32_t r = rows[i];
-        char* w = out.data() + rowOut[i];
+        char* w = out.get() + rowOut[i];
         Span id = idSpan[r];
         Span lb = labSpan[orderByRank[cur[r]]];
         memcpy(w, id.p, id.len);
@@ -802,12 +859,13 @@ int main(int argc, char** argv) {
         fprintf(stderr, "cannot write output.csv\n");
         return 1;
     }
-    fwrite(out.data(), 1, out.size(), g);
+    fwrite(out.get(), 1, rowOut[R], g);
     fclose(g);
     if (fd >= 0) {
         munmap((void*)buf, F);
         close(fd);
     }
-    if (timing) fprintf(stderr, "write: %.3fs (%.1f MB)\n", now_s() - t, out.size() / 1048576.0);
+    if (timing)
+        fprintf(stderr, "write: %.3fs (%.1f MB)\n", now_s() - t, rowOut[R] / 1048576.0);
     return 0;
 }
