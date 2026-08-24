@@ -1,36 +1,70 @@
 # label_propagation
 
-Synchronous Label Propagation (DolphinDB programming challenge).
+Synchronous Label Propagation（DolphinDB 编程挑战）。读入无向图 CSV，运行同步标签
+传播直至收敛，输出按 node_id 升序的 `output.csv`。无第三方依赖，仅 C++20 标准库 +
+OpenMP。
 
-## Build
+## 构建与运行
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+./build/label_propagation <input.csv>   # 结果写入当前目录 output.csv 后立即退出
 ```
 
-Requires a C++20 compiler and OpenMP (e.g. g++ 13+). No third-party dependencies.
+设置 `LP_TIMING=1` 可向 stderr 输出各阶段耗时。
 
-## Run
+## 架构
 
-```bash
-./build/label_propagation <input.csv>
-```
+- **读入**：整个文件 `mmap`，页错误与并行解析自然重叠，无独立 I/O 阶段
+- **解析**：按字节区间切分（对齐到换行），每线程独立解析自己的行区间
+  - 纯数字 node id（≤18 位）走专用 interner：以 `(数值, 长度)` 为键，16 字节槽位、
+    天然无碰撞（前导零不同长度视为不同 id）；其余走字符串 interner
+  - 邻居解析为 3 级流水线：提前解析后续 2 个 id 并预取其哈希槽位，隐藏内存延迟
+- **全局 ID = 行号**：先并行把所有行 id 插入分片表（值=行号），再并行把各线程局部
+  id 解析为行号（仅作为邻居出现、无行的 id 分配行号之后的附加 id）
+- **邻接表**：按行序 CSR，每线程顺序拷贝自己的邻居段（无随机 scatter）
+- **标签**：全局去重后按字典序排名，平票规则退化为"取最小整数 rank"
+- **迭代**：活跃前沿（active-frontier）——前几轮全量重算；变更数降到 N/4 以下后，
+  每轮只重算"邻居上一轮发生变化的节点"（同步语义通过 nxt 缓冲 + 轮末提交保持）
+- **输出**：已有序检测（数值 id 常见且有序则跳过排序）→ 数值 LSD 基数排序 /
+  字符串 std::sort 回退 → 并行拼装单个缓冲区 → 一次 fwrite
 
-Reads the input graph CSV, runs synchronous label propagation to
-convergence, and writes `output.csv` (node_id,final_label, sorted by
-node_id) to the current working directory, then exits.
+## 优化历程
 
-## Implementation notes
+基准数据：big.csv —— 2,000,000 节点 / 885 MB / 1.19 亿边端点（WSL2，14 线程，warm cache）。
 
-- Whole-file `mmap`, line-aligned byte-range parallel parsing
-- Numeric node ids resolved through a dedicated (value,length)-keyed
-  open-addressing interner; other ids through a string interner
-- Row-order CSR adjacency; label ranks assigned lexicographically so the
-  tie-break is a min over integer ranks
-- Active-frontier iteration: full rounds until changes drop below N/4,
-  afterwards only nodes adjacent to changed nodes are recomputed
-- Output order: already-sorted detection, LSD radix (numeric ids) or
-  std::sort fallback; single-buffer write
+| 版本 | 端到端 | 当时瓶颈与对策 |
+|---|---|---|
+| v1 基线 | 18.1s | 单线程解析邻居 ID（1.19 亿次哈希表查找）占 84%（15.6s） |
+| v2 | 4.1s | 每线程本地 interner 解析 + 分片锁并行合并；mmap 免独立读入 |
+| v3 | 2.9s | 串行 memchr 行扫描并行化；输出排序改基数 + 有序检测；并行拼装输出。教训：SoA interner 命中路径双随机访问反而更慢，回退 AoS |
+| v4 | 2.7s | 全局 ID 直接采用行号 → CSR 从随机 scatter 变纯顺序拷贝；去掉行号数组；解析循环加预取 |
+| v5 | 1.6s | 数值 id 专用 16B 注入式键 interner（无哈希碰撞/无 memcmp/槽位减半）；`make_unique_for_overwrite` 免 476MB 清零 |
+| v6 | **1.57s** | 解析流水线加深到 3 级预取；迭代全量轮恢复直接寻址 + `cur[adj[j+4]]` gather 预取 |
 
-Set `LP_TIMING=1` to print per-phase timings to stderr.
+8 线程（评测机同构）1.84s；冷缓存 1.84s；5M 节点/2.3GB 大盘 5.3s@8t、峰值内存 7.3GB。
+
+## 正确性验证
+
+- 官方样例比对
+- 8 组随机图与 Python 参考实现（按规格逐字实现）交叉验证：覆盖稀疏/稠密、多社区、
+  纯字符串/混合/前导零 ID、单标签、高标签数
+- 8 项边界用例：CRLF、UTF-8 BOM、引号字段、单节点、邻居前向引用、重复邻居、
+  800 种标签、乱序行
+- 200k 节点全量 Python 交叉验证
+
+已知边界：同步标签传播在个别结构（如网格棋盘构型）下会周期 2 振荡不收敛——这是
+算法本身的性质（参考实现同样不停），规格保证评测数据收敛，程序行为与规格一致。
+
+## 调试中修过的关键 bug（留作记录）
+
+1. 邻居列表最后一个 id 把 `]` 一起解析进去，产生带 `]` 的幽灵节点（官方样例因
+   幽灵票恰好也投 black 而侥幸通过）
+2. `rowOff` 缺末尾哨兵，最后一行度数读到越界垃圾值 → 大数据段错误
+3. 输出表头长度按 19 计算（实际 20），首行数据覆盖表头换行符
+4. `Interner::intern` 在 `grow()` 释放旧表后通过悬空引用 `return e.id`（UAF，
+   -O1/ASAN 布局侥幸通过，-O3 稳定崩溃）
+5. 输出偏移前缀按文件序累加、写入却按排序位置索引——数值 id 排序为恒等排列时
+   不触发，字符串 id 立即互相覆盖
+6. 预取循环中当前/下一个字符串哈希复用同一变量，用下一个的哈希 intern 当前字符串
