@@ -1,4 +1,4 @@
-# label_propagation
+# DolphinDB — Label Propagation Challenge
 
 Synchronous Label Propagation（DolphinDB 编程挑战）。读入无向图 CSV，运行同步标签
 传播直至收敛，输出按 node_id 升序的 `output.csv`。无第三方依赖，仅 C++20 标准库 +
