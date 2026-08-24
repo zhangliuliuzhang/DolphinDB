@@ -4,6 +4,8 @@ Synchronous Label Propagation（DolphinDB 编程挑战）。读入无向图 CSV�
 传播直至收敛，输出按 node_id 升序的 `output.csv`。无第三方依赖，仅 C++20 标准库 +
 OpenMP。
 
+> 优化过程与思考演进的完整叙述见 [THINKING.md](THINKING.md)。
+
 ## 构建与运行
 
 ```bash
